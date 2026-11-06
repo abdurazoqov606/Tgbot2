@@ -1,25 +1,25 @@
 """
 Telegram userbot: APK va havolalarni zudlik bilan o'chiradi va adminga bot orqali xabar beradi.
 
-1) Session olish (BIR MARTA, o'z kompyuter/Termux'ingizda):
-       pip install -r requirements.txt
-       python bot.py login
-   Chiqqan uzun matnni Render -> Environment -> SESSION_STRING ga qo'ying.
-
-2) Render'da ishga tushirish:
-       Start command: python bot.py
+Birinchi marta ishga tushganda bot ADMIN ga (bot orqali) telefon raqam va kod so'raydi,
+akkauntga "Samsung Galaxy S23 Ultra" qurilmasi nomidan kiradi. Oldin botga /start yuboring.
 """
 import asyncio
 import logging
 import os
 import re
-import sys
 from typing import Optional
 
 import aiohttp
 from aiohttp import web
 from telethon import TelegramClient, events
-from telethon.errors import FloodWaitError
+from telethon.errors import (
+    FloodWaitError,
+    PasswordHashInvalidError,
+    PhoneCodeExpiredError,
+    PhoneCodeInvalidError,
+    SessionPasswordNeededError,
+)
 from telethon.sessions import StringSession
 from telethon.tl.types import (
     DocumentAttributeFilename,
@@ -35,7 +35,14 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID", "8426582765"))
 
 # Render'da SESSION_STRING environment variable ga qo'ying (python bot.py login orqali olinadi).
 # Bu yerga to'g'ridan-to'g'ri ham yopishtirishingiz mumkin:
+SESSION_FILE = os.environ.get("SESSION_FILE", "session.txt")
 SESSION_STRING = os.environ.get("SESSION_STRING", "").strip()
+if not SESSION_STRING and os.path.exists(SESSION_FILE):
+    with open(SESSION_FILE, encoding="utf-8") as _f:
+        SESSION_STRING = _f.read().strip()
+# Ixtiyoriy: sessiya avtomatik Render Environment'ga saqlansin desangiz (redeploydan keyin ham yo'qolmaydi)
+RENDER_API_KEY = os.environ.get("RENDER_API_KEY", "")
+RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "")
 
 # Ruxsat etilgan domenlar. Bo'sh bo'lsa hamma havola o'chiriladi.
 ALLOWED_DOMAINS: list = []  # masalan: ["github.com", "google.com"]
@@ -59,8 +66,16 @@ client: Optional[TelegramClient] = None
 
 
 def make_client() -> TelegramClient:
-    session = StringSession(SESSION_STRING) if SESSION_STRING else "userbot_session"
-    return TelegramClient(session, API_ID, API_HASH)
+    return TelegramClient(
+        StringSession(SESSION_STRING),
+        API_ID,
+        API_HASH,
+        device_model="Samsung Galaxy S23 Ultra",
+        system_version="Android 14",
+        app_version="10.14.5",
+        lang_code="uz",
+        system_lang_code="uz",
+    )
 
 
 async def notify_admin(text: str) -> None:
@@ -219,40 +234,148 @@ async def start_health_server() -> None:
     log.info("Health server %s portda", port)
 
 
-async def login_mode() -> None:
-    """Lokal ishlatiladi: telefon raqam va kod so'raydi, SESSION_STRING chiqaradi."""
-    async with TelegramClient(StringSession(), API_ID, API_HASH) as c:
-        print("\n===== SESSION_STRING (butunlay nusxa oling) =====\n")
-        print(c.session.save())
-        print("\n=================================================")
-        print("Buni Render -> Environment -> SESSION_STRING ga qo'ying. Hech kimga bermang!")
+_offset = 0
+
+
+async def bot_api(method: str, timeout: int = 15, **payload):
+    global _http
+    if _http is None or _http.closed:
+        _http = aiohttp.ClientSession()
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    async with _http.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+        data = await resp.json()
+    return data.get("result") if data.get("ok") else None
+
+
+async def flush_updates() -> None:
+    global _offset
+    res = await bot_api("getUpdates", offset=-1, timeout=0)
+    if res:
+        _offset = res[-1]["update_id"] + 1
+
+
+async def get_reply(prompt: str, wait: int = 900) -> Optional[str]:
+    """Adminga savol yuboradi, javobini kutadi va javob xabarini (maxfiylik uchun) o'chiradi."""
+    global _offset
+    await notify_admin(prompt)
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + wait
+    while loop.time() < deadline:
+        try:
+            updates = await bot_api("getUpdates", timeout=40, offset=_offset, **{"allowed_updates": ["message"]})
+        except Exception as exc:  # noqa: BLE001
+            log.warning("getUpdates xatosi: %s", exc)
+            await asyncio.sleep(3)
+            continue
+        for upd in updates or []:
+            _offset = upd["update_id"] + 1
+            m = upd.get("message") or {}
+            if m.get("from", {}).get("id") != ADMIN_ID or "text" not in m:
+                continue
+            text = m["text"].strip()
+            if text.startswith("/start"):
+                await notify_admin(prompt)
+                continue
+            try:
+                await bot_api("deleteMessage", chat_id=ADMIN_ID, message_id=m["message_id"])
+            except Exception:  # noqa: BLE001
+                pass
+            return text
+    return None
+
+
+async def save_session() -> None:
+    s = client.session.save()
+    try:
+        with open(SESSION_FILE, "w", encoding="utf-8") as f:
+            f.write(s)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Session faylga yozilmadi: %s", exc)
+    if RENDER_API_KEY and RENDER_SERVICE_ID and _http:
+        try:
+            async with _http.put(
+                f"https://api.render.com/v1/services/{RENDER_SERVICE_ID}/env-vars/SESSION_STRING",
+                headers={"Authorization": f"Bearer {RENDER_API_KEY}", "Content-Type": "application/json"},
+                json={"value": s},
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as r:
+                log.info("Render env yangilandi: %s", r.status)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Render env yangilanmadi: %s", exc)
+    await notify_admin(
+        "✅ Akkauntga kirildi (Samsung Galaxy S23 Ultra).\n\n"
+        "Qayta deploydan keyin ham ishlashi uchun Render → Environment → <code>SESSION_STRING</code> ga "
+        "quyidagini qo'ying (keyin shu xabarni o'chiring, hech kimga bermang):\n\n"
+        f"<code>{s}</code>"
+    )
+
+
+async def interactive_login() -> None:
+    """Telefon raqam, kod va (kerak bo'lsa) 2FA parolni bot orqali admindan so'raydi."""
+    await flush_updates()
+    while True:
+        phone_text = await get_reply(
+            "📱 Userbot uchun akkaunt kerak.\nTelefon raqamingizni yuboring (masalan: <code>+998901234567</code>):"
+        )
+        if not phone_text:
+            continue
+        phone = "+" + re.sub(r"\D", "", phone_text)
+        try:
+            sent = await client.send_code_request(phone)
+        except FloodWaitError as exc:
+            await notify_admin(f"⏳ Telegram {exc.seconds} soniya kutishni so'radi.")
+            await asyncio.sleep(exc.seconds + 3)
+            continue
+        except Exception as exc:  # noqa: BLE001
+            await notify_admin(f"❌ Kod yuborilmadi: {type(exc).__name__}. Raqamni qayta yuboring.")
+            continue
+
+        while True:
+            code_text = await get_reply(
+                "🔑 Telegramga kelgan kodni yuboring.\n"
+                "⚠️ Raqamlar orasiga <b>tire</b> qo'ying, masalan: <code>1-2-3-4-5</code>. "
+                "Aks holda Telegram kodni xavfsizlik uchun bekor qiladi."
+            )
+            if not code_text:
+                break
+            code = re.sub(r"\D", "", code_text)
+            try:
+                await client.sign_in(phone=phone, code=code, phone_code_hash=sent.phone_code_hash)
+                await save_session()
+                return
+            except SessionPasswordNeededError:
+                while True:
+                    pw = await get_reply("🔐 Ikki bosqichli parolni (2FA) yuboring:")
+                    if not pw:
+                        continue
+                    try:
+                        await client.sign_in(password=pw)
+                        await save_session()
+                        return
+                    except PasswordHashInvalidError:
+                        await notify_admin("❌ Parol noto'g'ri, qayta yuboring.")
+            except PhoneCodeInvalidError:
+                await notify_admin("❌ Kod noto'g'ri. Qayta yuboring.")
+            except PhoneCodeExpiredError:
+                await notify_admin("⌛ Kod eskirdi. Yangi kod yuboriladi.")
+                break
+            except Exception as exc:  # noqa: BLE001
+                await notify_admin(f"❌ Xato: {type(exc).__name__}. Boshidan boshlaymiz.")
+                break
 
 
 async def main() -> None:
     global client
     await start_health_server()
 
-    if not SESSION_STRING:
-        msg = (
-            "SESSION_STRING topilmadi. Lokal kompyuterda `python bot.py login` ni ishga tushiring, "
-            "chiqqan matnni Render'da SESSION_STRING environment variable ga qo'ying."
-        )
-        log.error(msg)
-        await notify_admin("⚠️ " + msg)
-        while True:  # qayta-qayta crash bo'lmasligi uchun kutib turadi
-            await asyncio.sleep(3600)
-
     client = make_client()
     client.add_event_handler(on_new, events.NewMessage(incoming=True))
     client.add_event_handler(on_edit, events.MessageEdited(incoming=True))
-
     await client.connect()
+
     if not await client.is_user_authorized():
-        msg = "SESSION_STRING yaroqsiz yoki eskirgan. `python bot.py login` bilan yangisini oling."
-        log.error(msg)
-        await notify_admin("⚠️ " + msg)
-        while True:
-            await asyncio.sleep(3600)
+        log.info("Session yo'q, bot orqali login so'raladi")
+        await interactive_login()
 
     me = await client.get_me()
     log.info("Userbot ishga tushdi: %s (%s)", me.first_name, me.id)
@@ -278,7 +401,4 @@ async def runner() -> None:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "login":
-        asyncio.run(login_mode())
-    else:
-        asyncio.run(runner())
+    asyncio.run(runner())
